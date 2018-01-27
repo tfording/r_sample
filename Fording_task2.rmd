@@ -1,0 +1,407 @@
+---
+title: "Data Cleaning"
+author: "Tyler Fording"
+date: "Nov 5, 2017"
+output:
+  pdf_document: default
+  html_document: default
+---
+**Imports**
+```{r}
+library(tidyverse)
+```
+
+
+# A. "Real Property Taxes" Dataset 
+
+Download the "real property taxes" dataset from the website (via OpenBaltimore), 
+the data is located here (note you don\'t need to unzip it to read it into R):
+http://sisbid.github.io/Module1/data/Real_Property_Taxes.csv.gz
+
+
+
+## 1. Read the Property Tax data into R and call it the variable `tax`
+*Initial plan: This is just a normal read.csv paired with a gzfile*  
+Many of these columns are alphanumeric, so typing them during the import isn't easy.
+```{r}
+tax <- read_csv(gzfile("/Users/TFording/Desktop/Real_Property_Taxes.csv.gz"), col_names = TRUE, col_types = cols(
+  PropertyID = col_character(),
+  Block = col_character(),
+  Lot = col_character(),
+  Ward = col_character(),
+  Sect = col_character(),
+  PropertyAddress = col_character(),
+  LotSize = col_character(),
+  CityTax = col_character(),
+  StateTax = col_character(),
+  ResCode = col_character(),
+  AmountDue = col_character(),
+  AsOfDate = col_character(),
+  Neighborhood = col_character(),
+  PoliceDistrict = col_character(),
+  CouncilDistrict = col_integer(),
+  Location = col_character()
+))
+head(tax) ## To orient myself to the data
+```
+
+
+
+## 2. How many addresses pay property taxes? 
+
+
+*Initial plan: I need to count the number of rows that pay city taxes and the number of rows that state taxes.* 
+
+Here I pulled the number of total rows out first to orient myself and ensure that the data set was smaller after the nulls were removed.
+
+
+```{r}
+rows <- nrow(tax) ## total number of rows 238198
+
+city_tax_nulls <- tax %>%
+  filter(!is.na(CityTax)) %>%
+  select(PropertyID, PropertyAddress, CityTax) ## Pulling out only columns needed to answer the current question
+citytaxrows <- nrow(city_tax_nulls)
+```
+```{r, echo=FALSE}
+cat("The number of city property tax payers in the data are:", citytaxrows) ## total number of non-null CityTax values in tibble (219178)
+```
+```{r}
+state_tax_nulls <- tax %>%
+  filter(!is.na(StateTax)) %>%
+  select(PropertyID, PropertyAddress, StateTax) ## Pulling out only columns needed to answer the current question
+statetaxrows <- nrow(state_tax_nulls) 
+```
+```{r, echo=FALSE}
+cat("The number of state property tax payers in the data are:", statetaxrows) ## total number of non-null StateTax values tibble (219378)
+```
+
+
+**These numbers don't match, which indicates there are some properties where state tax is required, but not city and perhaps vice-versa.**
+**To identify if there are differences in the data I need to do a full_join to get the combined number of addresses that pay property tax**
+```{r}
+total_tax_payers <- full_join(state_tax_nulls, city_tax_nulls) 
+total_payers <- nrow(total_tax_payers)
+```
+```{r, echo=FALSE}
+cat("The total number of property tax paying addresses is:", total_payers)
+```
+```{r, echo=FALSE}
+cat("It appears there are", (total_payers-citytaxrows), "addresses in the data that do not pay city taxes")
+```
+
+
+**In order to verify the above I am doing an anti join, which should create a tibble with only the non-overlapping rows.**
+```{r}
+onlystate_payers <- anti_join(state_tax_nulls, city_tax_nulls)
+```
+```{r, echo=FALSE}
+cat(nrow(onlystate_payers))
+```
+ This little sanity check matches my expectation, so I'm moving forward with the data profiling.
+
+
+## 3. What is the total city and state tax paid?
+
+*Initial plan: In order to answer this question I'm going to have to parse the two tax columns. Since they are currently <character> type columns I can't just sum them as is.*
+
+```{r}
+total_tax_income <- tax %>%
+  select(PropertyID, PropertyAddress, CityTax, StateTax)  ## Pulling out only columns needed to answer the current question
+head(total_tax_income)
+```
+```{r}
+total_tax_income <- total_tax_income%>%
+  mutate(CityTaxVal = as.numeric(gsub('[$,]', '', CityTax))) %>%   ## This and the following mutate remove all columns and dollar signs from 
+  mutate(StateTaxVal = as.numeric(gsub('[$,]', '', StateTax))) %>% ## the *Tax columns and creates new columns with the subs
+  select(PropertyID, PropertyAddress, CityTax, CityTaxVal, StateTax, StateTaxVal) ## Rearranged columns for the sake of readability
+head(total_tax_income)
+```
+I left the <character> Tax columns in place to ensure the values matched up. 
+
+
+```{r}
+tot_city = sum(total_tax_income$CityTaxVal, na.rm = TRUE)
+tot_state = sum(total_tax_income$StateTaxVal, na.rm = TRUE)
+tot_tax = tot_city+tot_state
+library('scales')  ##late import since it was clashing with readr
+```
+```{r, echo=FALSE}
+cat("The total city tax paid is:", dollar_format()(c(tot_city)),"and the total state tax paid is:", dollar_format()(c(tot_state)), "for a combined property tax amount of:", dollar_format()(c(tot_tax)))
+```
+
+
+## 4. Convert the 'lotSize' variable to a numeric square feet variable. Tips:
+* Look at the data 
+* Assume hyphens represent inches within square foot meassuremnts 
+* Assume decimals within acreage measurements
+* 1 acre = 43560 square feet
+* Look at the data again ... it's tricky!
+
+*Initial plan: Since there are multiple different cases in this column, I am going to try to break them down by case. To do this I want to break each case into its own column, which will require some mutates. From there I will conduct the calculation based on the case, transmuting the column based on the calculation and then merge all of the columns back into a single with a gather.* 
+
+This data column contained a lot of broken/unexpected entries. I ended up leaving the 'LotSize' column and adding a 'LotSizeSqft' in the final cleaned tibble "clean_tax", I put those two columns next to each other for the sake of clarity. There are 4 dataframes (unfixable1, unfixable2, unfixable3, unfixable4) with data that could not be converted and one data frame (leftovers2) with a bunch of random unexpected cases that would require indiviudal attention. 
+
+```{r}
+lot_sizes <- tax %>%
+  select(PropertyID, PropertyAddress, LotSize)
+head(lot_sizes)
+nrow(tax)
+```
+
+
+**These are main cases to deal with in the data, they all have nuanced subtypes**
+
+* Convert acres to sqft (acrex43560) **(1a)**
+    + There are values that appear with ACRES+/- **(1b)**
+    + There are values that use '-' instead of '.' **(1c)**
+* Flat sqft character **(2)**
+    + SQ FT **(2a)**
+    + SQFT **(2b)**
+    + S.F. **(2c)**
+* Convert ft x ft **(3)**
+* Leftovers **(4)**
+
+
+#### Case 1a, b, and c
+```{r}
+case1 <- lot_sizes %>%
+  filter(grepl("AC", LotSize)) %>%
+  mutate(LotSizeAcre = gsub('[QLACRESEGST+/,FWR (IMP) +/-]', '', LotSize)) %>%
+  mutate(LotSizeAcre = gsub('[(LAND) F.L. (SUBMR) IMP.ONLY]', '', LotSizeAcre)) %>%
+  mutate(LotSizeAcre = gsub('[O]', '0', LotSizeAcre)) %>%
+  mutate(LotSizeAcre = as.numeric(gsub('[-]', '.', LotSizeAcre))) %>%
+  mutate(LotSizeSqft = LotSizeAcre*43560)
+
+  
+head(case1) 
+nrow(case1) ## 18710 total rows
+case1b <- case1 %>%  ## This block of code deals with a single case in which the acres are given as 21.8X5.5 ACRES which seems like a super wonky measurement. 
+  ##I assume it was meant to be a measurement other than acres, but I can't randomly assign units, so I'm going to treat it as area (L*W = Area), 
+  ##then I'm going to compute the sqft based on the area number. If this were scientific data, I wouldn't be comfortable doing something like this, I would want to   
+  ##discuss it with the experimentors.
+  filter(is.na(LotSizeAcre)) %>%
+  mutate(LotSizeAcre = gsub('[ACRES]', '', LotSize)) %>%
+  mutate(LotSizeAcre = gsub('[-]', '.', LotSizeAcre)) %>%
+  separate(LotSizeAcre, c("val1", "val2"), 'X') %>%
+  mutate(LotSizeAcre = as.numeric(val1) * as.numeric(val2)) %>%
+  mutate(LotSizeSqft = LotSizeAcre * 43560) %>%
+  select(PropertyID, PropertyAddress, LotSize, LotSizeAcre, LotSizeSqft)
+
+nrow(case1b)
+head(case1b)
+```
+
+There appear to be 235 cases that this approach did not work for. So far I have been able to find 2 different additional sub-cases. I added them to my break down above, but they are the cases in which 'ACRES' has an addition '+/-' after it, and the case in which the actual numerical value has a hyphen separation instead of a decimal.
+
+There are now only 95 cases. If they are all caused by the '+/-', which is presumably now '+/.' I should be able to get rid of them by adding them to the gsub replace.
+
+**I keep finding random characters that need to be added to the gsub() that replaces them with nothing.**
+
+There is also a case in which there is an acreXacre value. So I will need to compute that as well. I've also noticed that some of the properties don't have measurements under "LotSize", its just a string saying things like "AIR RIGHTS" and "ASSES CITY". Some of the values only have AC, I'm going to assume this means ACRES. I feel like I ended up having to just enter random fringe cases of extra strings into the gsub commands to get to the actual expected value. This is only the first case, so I assume it will continue like this as I get deeper into the data set. If this were scientific data I would be trying to talk to the individual who generated it to ensure the data wasn't corrupt or just not what was meant to be given. Since its not I'll just clean it as best I can. I'm going to leave the properties with no LotSize measurement in the dataframe, but their SqFt column will show NA.
+
+** I have completed the cleaning steps for all of the LotSizes with Acre or AC in them. I just need to join the two data frames back together.**
+
+
+#### 1: Acres final tibble
+```{r}
+acres_case <- full_join(case1b, case1) # This should result in 18750 rows. However, I need to filter out the duplicate for PropertyID: 1476F013A
+acres_case <-  acres_case %>%
+  filter(!is.na(LotSizeSqft))
+nrow(acres_case)
+
+```
+The tibble has the expected number of rows. I will now move on to case two.
+
+After moving on I shortly realized I hadn't thought about lowercase letters, but luckily, upon inspection the data does not appear to contain any lowercase letters at all.
+
+### Case 2a
+```{r}
+case2a <- lot_sizes %>%
+  filter(grepl("SQ FT", LotSize)) %>%
+  mutate(LotSizeSqft = (gsub('[SQ FT IMP ONLY]', '', LotSize))) %>%
+  mutate(LotSizeSqft = as.numeric((gsub('[,]', '', LotSizeSqft))))  # This operation sort of scares me with this data since there are so many comma/decimal errors, but it will solve the most general error case.
+nrow(case2a) #2a ready
+```
+### Case 2b
+```{r}
+
+case2b <- lot_sizes %>%
+  filter(grepl("SQFT", LotSize)) %>%
+  mutate(LotSizeSqft = gsub('[SQFT  IMP ONLY]', '', LotSize)) %>%
+  mutate(LotSizeSqft = as.numeric(gsub('[,]', '', LotSizeSqft))) #2b ready
+nrow(case2b) #2b ready
+```
+### Case 2c
+```{r}
+
+case2c <- lot_sizes %>%
+  filter(grepl("S.F.", LotSize)) %>%
+  mutate(LotSize_itm = gsub(' .*', '', LotSize)) %>% #removes everything after the first space in the value
+  mutate(LotSize_itm = as.numeric(gsub('[ SQFT IMP ONLY]', '', LotSize_itm))) 
+# There remain 71 cases in which this doesn't work, however I can deal with them more easily on their own and join them back in. 
+nrow(case2c)
+
+
+case2c1 <- case2c %>% #fixed cases to be joined
+  filter(!is.na(LotSize_itm)) %>%
+  mutate(LotSizeSqft = LotSize_itm) %>% ## This block reformats the corrected values to match everything else I've done.
+  select(PropertyID, PropertyAddress, LotSize, LotSizeSqft)
+nrow(case2c1)
+
+
+case2c2 <- case2c %>% 
+  filter(is.na(LotSize_itm)) %>%
+  mutate(LotSize_itm = gsub('^[A-Z]*', '', LotSize)) %>%
+  mutate(LotSize_itm = as.numeric(gsub('[, SQFT]', '', LotSize_itm))) ## Still 2 cases left in this tibble
+
+
+case2c3 <- case2c2 %>% #fixed cases to be joined 
+  filter(!is.na(LotSize_itm)) %>%
+  mutate(LotSizeSqft = LotSize_itm) %>%
+  select(PropertyID, PropertyAddress, LotSize, LotSizeSqft)
+nrow(case2c3)
+
+
+case2c4 <- case2c2 %>%  # fixed cases to be joined
+  filter(is.na(LotSize_itm)) %>%
+  mutate(LotSizeSqft = gsub('S.F.', '', LotSize)) %>%
+  mutate(LotSizeSqft = as.numeric(gsub("[^A-Za-z0-9]" , '', LotSizeSqft))) %>% # remove all but alphanum
+  select(PropertyID, PropertyAddress, LotSize, LotSizeSqft)
+nrow(case2c4)
+```
+### Joining Tibbles
+```{r}
+### joining all tibbles back together
+## CASE2C
+case2c_final_almost <- full_join(case2c1, case2c3)
+case2c_final <- full_join(case2c_final_almost, case2c4)
+
+#CASE2a AND 2b
+case2ab_final <- full_join(case2a, case2b)
+
+#CASE2ab and c
+case2_final <- full_join(case2ab_final, case2c_final)
+nrow(case2_final)
+```
+It appears my case for case2b was not specific enough and I ended up pulling and cleaning 120 items redundantly. 
+*NOTE TO SELF: 238198 total rows*
+
+**Another Fringe Case: PropertyID: 4652D105** This row has a LotSize of 1.9XX sqft. It seems more likely it was meant to be 1,9XX sqft, but since I have no way of verifying this I am going to treat the property as 1.9sqft.
+
+I'm finding LotSize values in super odd formats like "1244 S.F. 2.950%" as well as numbers formatted with multiple decimals/commas. 
+
+### Case 3a
+**This seems to be the most common case**
+This is the case in which we are going to have to multiple the two foot measurements together to get square feet.
+```{r}
+
+case3 <- lot_sizes %>%
+  filter(grepl("X", LotSize)) %>%
+  mutate(LotSize_int = LotSize) %>%
+  separate(LotSize_int, into = c('LotSize_1ft', 'LotSize_2ft'), sep='X') %>%
+  separate(LotSize_1ft, into = c('LotSize_1ft', 'LotSize_1in'), sep='-') %>%
+  separate(LotSize_2ft, into = c('LotSize_2ft', 'LotSize_2in'), sep='-') %>%
+  mutate(LotSize_1in = as.numeric(LotSize_1in) / 12) %>%  ## Converts inches to feet
+  mutate(LotSize_2in = as.numeric(LotSize_2in) / 12) %>%
+  replace_na(list(LotSize_1in = 0, LotSize_2in = 0)) %>% ## converst NA to zeros
+  mutate(LotSize_1ft = as.numeric(LotSize_1ft)+LotSize_1in) %>% ## adds converted inches to feet
+  mutate(LotSize_2ft = as.numeric(LotSize_2ft)+LotSize_2in) %>%
+  select(-LotSize_1in, -LotSize_2in) %>%
+  mutate(LotSizeSqft = (as.numeric(LotSize_1ft) * as.numeric(LotSize_2ft))) 
+ 
+nrow(case3)
+```
+```{r}
+case3a <- case3 %>% ## ready to be joined 
+  filter(!is.na(LotSizeSqft)) %>%
+  select(PropertyID, PropertyAddress, LotSize, LotSizeSqft)
+nrow(case3a)
+```
+This worked for 203750 out of 203820 cases, leaving 77 broken cases. There were also 84 rows that included multiple sets of dimensions as well. I don't know if these are supposed to be satellite plots of the property or if they're errors where the person inputing the data just didn't hit enter to put the data in a new cell. I'm going to discard the secondary dimensions here, but again if this were scientific data I would be trying to take these cases to the experimentor for verification.
+
+
+### Joining All Fixed Data
+```{r}
+final_acres_case<- acres_case %>%
+  select(PropertyID, PropertyAddress, LotSize, LotSizeSqft)
+
+case1_2 <- full_join(final_acres_case, case2_final)
+nrow(case1_2)
+
+fixed_tax_data <- full_join(case1_2, case3a)
+nrow(fixed_tax_data)
+
+check1 <- fixed_tax_data %>%
+  filter(is.na(LotSizeSqft))
+nrow(check1)
+
+broken_rows <-anti_join(tax, fixed_tax_data, by = c('PropertyID', 'PropertyAddress'))
+nrow(broken_rows) ## There are a lot fixable cases left here.
+
+
+almost_full_tax <- left_join(tax, fixed_tax_data, by = c('PropertyID', 'PropertyAddress', 'LotSize'))
+full_tax <- almost_full_tax %>%
+  filter(!is.na(LotSizeSqft))
+nrow(full_tax)
+```
+There were 2105 rows of unfixed data that I want to comb one last time. 
+
+There were zero nulls found in the data I expected to have a value for "LotSizeSqft".
+
+### Case 4: Leftovers
+
+```{r}
+leftovers <- broken_rows %>%
+  filter(grepl("SF", LotSize)) %>% #These all appear to be raw Sqft data 
+  mutate(LotSizeSqft = gsub('[^0-9]', '', LotSize))
+```
+This fixed an additional 1766 cases.
+
+#### Joining back to other clean data
+```{r}
+clean_tax <- full_join(full_tax, leftovers, by = c('PropertyID', 'PropertyAddress', 'LotSize'))
+nrow(clean_tax)
+```
+Final 'cleaned' tibble has the expected number of rows after adding back 1766 fixed rows.
+
+
+```{r}
+leftovers2 <- broken_rows %>% ## leftovers
+  filter(!grepl("SF", LotSize)) %>%
+  filter(!grepl("IMPROVEMENT ONLY", LotSize)) %>%
+  filter(!grepl("IMP ONLY", LotSize)) %>%
+  filter(!grepl("AIR RIGHTS", LotSize)) %>%
+  filter(!is.na(LotSize))
+nrow(leftovers2)
+
+
+
+unfixable1 <- broken_rows %>% ## leftovers
+  filter(!grepl("SF", LotSize)) %>%
+  filter(grepl("IMPROVEMENT ONLY", LotSize))
+nrow(unfixable1)
+
+unfixable2 <- broken_rows %>%
+  filter(!grepl("SF", LotSize)) %>%
+  filter(grepl("IMP ONLY", LotSize)) 
+nrow(unfixable2)
+  
+unfixable3 <- broken_rows %>%
+  filter(!grepl("SF", LotSize)) %>%
+  filter(grepl("AIR RIGHTS", LotSize)) 
+nrow(unfixable3)
+
+unfixable4 <- broken_rows %>%
+  filter(!grepl("SF", LotSize)) %>%
+  filter(is.na(LotSize)) 
+nrow(unfixable4)
+
+```
+There are 110 rows where the "LotSize" column doesn't contain a number at all, it contains "IMPROVEMENTS ONLY", "IMP ONLY", "AIR RIGHTS" or NAs.
+
+
+Of the remaining 232 rows there are giant unitless numbers, percentages, columns with only strings, cubic feet measurements (property with airspace included?), other random oddities, as well as a few fixable cases that would need individual attention. 
+
+
+ 
